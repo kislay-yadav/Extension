@@ -32,7 +32,7 @@ log = logging.getLogger("arocatcher")
 API_ID      = int(os.environ.get("TG_API_ID", "21952127"))
 API_HASH    = os.environ.get("TG_API_HASH", "e0a3741bb3b132947d86d8fc6218eebe")
 SESSION_STR = os.environ.get("TG_SESSION", "1BVtsOIUBu47QAKSS-BHZ8E2-w_DzQf-lCUwdX7F-HuTSV82Lb68-eha9jYHLC-19Vt1fg7BDdilHEUDwS0mWNkNp45nBScSfl8rUUN9O5hBPG7dug-dTDsGIpfBsJUXlXKsPDK4-G5njJJzLnJf0oYv61iHo-zIrKq48IjeY-n8-7PgRLQ0ChQJGZD4tg8XFat9zSTTOaIXqpdDNnCaRVj3zv4cQX9xEjRctTS9Ir1CGTHgaLrK4hFCJjvL5gznWFhaUBN6xmgmnWkJxGVN7bT3UvkdrmXee6IlMRZE4LBvDkEFpeXVlYmpNrpebG13zO4jyYN7RuPUPAYWziV8Dlak2DDWFtyg=")
-CHANNEL     = os.environ.get("TG_CHANNEL", "")
+CHANNEL     = os.environ.get("TG_CHANNEL", "@linkbypassfree")
 SECRET_KEY  = os.environ.get("SECRET_KEY", "changeme")
 
 # ── State ─────────────────────────────────────────────────────────
