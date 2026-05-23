@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: arolink-catcher-v2
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
+        sync: false
+      - key: TG_SESSION
+        sync: false
+      - key: TG_CHANNEL
+        sync: false
+      - key: SECRET_KEY
+        sync: false
