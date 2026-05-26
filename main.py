@@ -1,27 +1,14 @@
 """
-AroLink Catcher Backend v2
-==========================
-- Session is created via https://tg-n7dh.onrender.com/register (web login)
-  so the IP stays consistent on Render — no ban risk.
-- Extension sends arolinks URL → userbot sends to channel → channel bot
-  resolves it → userbot captures reply → returns direct URL to extension.
-
-Environment variables to set on Render:
-  TG_API_ID       → from my.telegram.org
-  TG_API_HASH     → from my.telegram.org
-  TG_SESSION      → from /get-session after web login
-  TG_CHANNEL      → @yourchannel or -100xxxxxxxxxx
-  SECRET_KEY      → any password you choose
+AroLink Catcher Backend — v9
+Send directly to @Nick_Bypass_Bot (private, fast, no channel noise)
+Bot replies directly to userbot in private/saved messages
 """
 
-import os, asyncio, re, uuid, logging
+import os, asyncio, re, uuid, logging, httpx
 from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -31,198 +18,241 @@ log = logging.getLogger("arocatcher")
 # ── Config ────────────────────────────────────────────────────────
 API_ID      = int(os.environ.get("TG_API_ID", "21952127"))
 API_HASH    = os.environ.get("TG_API_HASH", "e0a3741bb3b132947d86d8fc6218eebe")
-SESSION_STR = os.environ.get("TG_SESSION", "1BVtsOIUBu47QAKSS-BHZ8E2-w_DzQf-lCUwdX7F-HuTSV82Lb68-eha9jYHLC-19Vt1fg7BDdilHEUDwS0mWNkNp45nBScSfl8rUUN9O5hBPG7dug-dTDsGIpfBsJUXlXKsPDK4-G5njJJzLnJf0oYv61iHo-zIrKq48IjeY-n8-7PgRLQ0ChQJGZD4tg8XFat9zSTTOaIXqpdDNnCaRVj3zv4cQX9xEjRctTS9Ir1CGTHgaLrK4hFCJjvL5gznWFhaUBN6xmgmnWkJxGVN7bT3UvkdrmXee6IlMRZE4LBvDkEFpeXVlYmpNrpebG13zO4jyYN7RuPUPAYWziV8Dlak2DDWFtyg=")
-CHANNEL     = os.environ.get("TG_CHANNEL", "@linkbypassfree")
+SESSION_STR = os.environ.get("TG_SESSION", "1BVtsOIUBu4dSO-RTLWmhNwNJaRIK3CrDRwhpG3X2fE2aLkQkvAdZjhgfLOU2uFyyFq7Lqx5Vl1_Hr3fasapOBrfsu9i2s7RBbd4Gf66i76oBZ7JvkWsRdemFcZl-d-Q7RoGwTFQvLBLky9tZ3bhA_V1T3IjkhjnXmxdbIBLDTRVd8pCxgEM6Dd2VEjnlyPm6Nnr_8UK5UDVX2j1ulPvnJgn6XgRL7XxMwRsbrdrEO52SF6UqrxaxWipe2uq-kuFLVYkBDkho_rDgt71cJoCT2oE1swVmNHR7s_D06a0sIcJYmsZVzENqHqcPDDNdZVX374Vj3TXHq_G0rj6mDChYtQBsQd5fyFA=")
 SECRET_KEY  = os.environ.get("SECRET_KEY", "changeme")
+RENDER_URL  = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+# Send directly to Nick Bypass Bot
+BOT_USERNAME = os.environ.get("BYPASS_BOT", "@Nick_Bypass_Bot")
+
+SKIP = ['google.com', 'telegram.org', 'telegra.ph',
+        't.me', 'bit.ly', 'youtube.com']
 
 # ── State ─────────────────────────────────────────────────────────
-pending      : dict[str, asyncio.Future] = {}
-last_code    : dict[str, str]            = {}   # req_id → arolink code
-client       : TelegramClient | None     = None
+results   : dict = {}  # req_id → {status, url, error}
+sent_msgs : dict = {}  # req_id → sent message id
+last_code : dict = {}  # req_id → arolink code
+last_msgs : list = []  # debug
+client    : TelegramClient | None = None
 
-# ── Channel message handler ───────────────────────────────────────
-def setup_handlers(c: TelegramClient):
-    @c.on(events.NewMessage(chats=CHANNEL))
-    async def on_msg(event):
-        text = event.message.text or ""
-        log.info(f"Channel message: {text[:80]}")
+# ── Extract bypassed URL from bot reply ───────────────────────────
+def get_bypassed_url(text: str) -> str:
+    # Method 1: URL after "Bypassed Link"
+    m = re.search(r'[Bb]ypassed\s*[Ll]ink[^h]*(https?://\S+)', text, re.DOTALL)
+    if m:
+        u = m.group(1).rstrip('* \n.,);\'\"')
+        if u and not any(s in u for s in SKIP):
+            return u
 
-        # Extract URLs from message
-        urls = re.findall(r'https?://\S+', text)
-        # Filter out ad/intermediate domains
-        SKIP = ['arolinks.com','mahnokari.com','t.co','bit.ly']
-        dest_urls = [u.rstrip('.,)') for u in urls if not any(s in u for s in SKIP)]
+    # Method 2: last URL in message (bypassed is always last)
+    all_urls = re.findall(r'https?://[^\s\*\n\)\]\"\']+', text)
+    candidates = []
+    for u in all_urls:
+        u = u.rstrip('* \n.,);\'\"')
+        if u and not any(s in u for s in SKIP):
+            candidates.append(u)
+    return candidates[-1] if candidates else ""
 
-        if not dest_urls:
+def resolve_req(req_id: str, url: str, method: str):
+    if req_id in results and results[req_id]["status"] == "pending":
+        results[req_id] = {"status": "done", "url": url}
+        log.info(f"✅ [{method}] {req_id} → {url[:80]}")
+
+# ── Handle bot reply ──────────────────────────────────────────────
+async def handle_bot_reply(event):
+    try:
+        text     = event.message.text or event.message.message or ""
+        msg_id   = event.message.id
+        reply_to = event.message.reply_to_msg_id or 0
+        from_id  = getattr(event.message.from_id, 'user_id', 0)
+
+        log.info(f"📨 msg={msg_id} from={from_id} reply_to={reply_to}")
+        log.info(f"   text={text[:150]}")
+
+        last_msgs.append({
+            "msg_id": msg_id, "from_id": from_id,
+            "reply_to": reply_to, "text": text[:200]
+        })
+        if len(last_msgs) > 20:
+            last_msgs.pop(0)
+
+        # Skip Processing message
+        if "Processing" in text and len(text) < 30:
             return
 
-        # Match to pending request by code or req_id tag
+        # Get pending requests
+        pending = {k: v for k, v in results.items()
+                   if v["status"] == "pending"}
+        if not pending:
+            return
+
+        # Extract bypassed URL
+        result_url = get_bypassed_url(text)
+        if not result_url:
+            log.info(f"No URL found in: {text[:80]}")
+            return
+
+        log.info(f"🎯 URL: {result_url[:80]}")
+
         matched = False
-        for req_id, code in list(last_code.items()):
-            if code in text or f"#req_{req_id}" in text:
-                fut = pending.get(req_id)
-                if fut and not fut.done():
-                    fut.set_result(dest_urls[0])
-                    matched = True
-                    log.info(f"✅ Matched req {req_id} → {dest_urls[0]}")
+        for req_id in list(pending.keys()):
+            # Match by reply_to_msg_id (most reliable)
+            if reply_to and reply_to == sent_msgs.get(req_id):
+                resolve_req(req_id, result_url, "msg_id")
+                matched = True
                 break
 
-        # Fallback: resolve oldest pending request
-        if not matched and pending:
-            oldest = next(iter(pending))
-            fut = pending[oldest]
-            if not fut.done():
-                fut.set_result(dest_urls[0])
-                log.info(f"✅ Fallback match req {oldest} → {dest_urls[0]}")
+            # Match by arolink code in text
+            code = last_code.get(req_id, "")
+            if code and code in text:
+                resolve_req(req_id, result_url, "code")
+                matched = True
+                break
+
+            # Fallback: only one pending → must be ours
+            if len(pending) == 1:
+                resolve_req(req_id, result_url, "fallback")
+                matched = True
+                break
+
+        if not matched:
+            log.warning(f"No match. pending={list(pending.keys())} reply_to={reply_to} sent={sent_msgs}")
+
+    except Exception as e:
+        log.error(f"handle_bot_reply: {e}", exc_info=True)
+
+# ── Setup handlers — listen to messages FROM the bot ─────────────
+def setup_handlers(c: TelegramClient):
+
+    @c.on(events.NewMessage(incoming=True, from_users=BOT_USERNAME))
+    async def on_bot_reply(event):
+        """Catch replies from @Nick_Bypass_Bot directly to our userbot."""
+        await handle_bot_reply(event)
+
+    @c.on(events.NewMessage(incoming=True))
+    async def on_any_incoming(event):
+        """Backup: catch any incoming message that might be from bot."""
+        try:
+            from_id = getattr(event.message.from_id, 'user_id', 0)
+            # Nick Bypass Bot user ID
+            if from_id == 8226002644:
+                await handle_bot_reply(event)
+        except Exception as e:
+            log.error(f"on_any_incoming: {e}")
+
+# ── Auto-ping ─────────────────────────────────────────────────────
+async def auto_ping():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            url = RENDER_URL or "http://localhost:8000"
+            async with httpx.AsyncClient() as hc:
+                r = await hc.get(f"{url}/health", timeout=10)
+                log.info(f"🏓 Ping {r.status_code}")
+        except Exception as e:
+            log.warning(f"Ping: {e}")
+        await asyncio.sleep(600)
 
 # ── Lifespan ──────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client
-    if SESSION_STR and API_ID and API_HASH:
-        client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
-        setup_handlers(client)
-        await client.start()
-        me = await client.get_me()
-        log.info(f"✅ Userbot online: {me.first_name} (@{me.username})")
-    else:
-        log.warning("⚠️  TG_SESSION / API_ID / API_HASH not set — userbot offline")
+    client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
+    setup_handlers(client)
+    await client.start()
+    me = await client.get_me()
+    log.info(f"✅ Userbot: {me.first_name} @{me.username}")
+    log.info(f"🤖 Sending to bot: {BOT_USERNAME}")
+    ping_task = asyncio.create_task(auto_ping())
     yield
-    if client:
-        await client.disconnect()
+    ping_task.cancel()
+    await client.disconnect()
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── Models ────────────────────────────────────────────────────────
-class ResolveReq(BaseModel):
+class SubmitReq(BaseModel):
     url: str
     secret: str
 
-# ── /resolve — main endpoint called by extension ─────────────────
-@app.post("/resolve")
-async def resolve(req: ResolveReq):
+# ── POST /submit ──────────────────────────────────────────────────
+@app.post("/submit")
+async def submit(req: SubmitReq):
     if req.secret != SECRET_KEY:
-        raise HTTPException(401, "Invalid secret key")
-
+        raise HTTPException(401, "Invalid secret")
     if "arolinks.com" not in req.url:
         raise HTTPException(400, "Not an arolinks URL")
-
     if not client or not client.is_connected():
-        raise HTTPException(503, "Userbot not connected. Set TG_SESSION in Render env vars.")
-
-    if not CHANNEL:
-        raise HTTPException(503, "TG_CHANNEL not configured.")
+        raise HTTPException(503, "Userbot offline")
 
     code   = req.url.rstrip('/').split('/')[-1].split('?')[0]
     req_id = uuid.uuid4().hex[:8]
 
-    loop = asyncio.get_event_loop()
-    fut  = loop.create_future()
-    pending[req_id]   = fut
+    results[req_id]   = {"status": "pending", "url": None}
     last_code[req_id] = code
 
-    # Send to channel
-    msg = f"🔗 {req.url}\n\n#req_{req_id}"
-    await client.send_message(CHANNEL, msg)
-    log.info(f"📤 Sent to channel: {req.url} [req={req_id}]")
+    # Send directly to @Nick_Bypass_Bot
+    sent = await client.send_message(BOT_USERNAME, req.url)
+    sent_msgs[req_id] = sent.id
+    log.info(f"📤 Sent to {BOT_USERNAME} msg_id={sent.id}: {req.url}")
 
-    try:
-        result = await asyncio.wait_for(fut, timeout=30.0)
-        return {"success": True, "url": result, "code": code}
-    except asyncio.TimeoutError:
-        return {"success": False, "error": "Channel didn't reply in 30s. Check your channel bot.", "code": code}
-    finally:
-        pending.pop(req_id, None)
-        last_code.pop(req_id, None)
+    return {"ok": True, "req_id": req_id, "code": code}
 
-# ── /health ───────────────────────────────────────────────────────
+# ── GET /result/:req_id ───────────────────────────────────────────
+@app.get("/result/{req_id}")
+async def get_result(req_id: str, secret: str = ""):
+    if secret != SECRET_KEY:
+        raise HTTPException(401, "Invalid secret")
+    if req_id not in results:
+        return {"status": "not_found"}
+    r = results[req_id]
+    return {"status": r["status"], "url": r.get("url"), "error": r.get("error")}
+
+# ── GET /health ───────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     if client and client.is_connected():
         me = await client.get_me()
-        return {"status": "ok", "userbot": me.first_name, "username": me.username}
-    return {"status": "offline", "userbot": None}
+        return {"status": "ok", "userbot": me.first_name,
+                "username": me.username}
+    return {"status": "offline"}
 
-# ── /session-setup — web UI to guide session creation ────────────
-@app.get("/session-setup", response_class=HTMLResponse)
-async def session_setup():
-    return HTMLResponse(f"""
-<!DOCTYPE html>
-<html>
-<head>
-  <title>AroLink — Session Setup</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <style>
-    *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{background:#0d0d0d;color:#f0f0f0;font-family:monospace;
-         display:flex;align-items:center;justify-content:center;
-         min-height:100vh;padding:20px}}
-    .card{{background:#161616;border:1px solid #252525;border-radius:10px;
-           padding:28px;max-width:480px;width:100%}}
-    h2{{font-size:18px;margin-bottom:6px;color:#00ff88}}
-    p{{color:#666;font-size:12px;margin-bottom:20px;line-height:1.6}}
-    .step{{background:#0a0a0a;border:1px solid #252525;border-radius:6px;
-           padding:12px 14px;margin-bottom:10px;font-size:12px;line-height:1.8}}
-    .step b{{color:#00ccff}}
-    a{{color:#00ff88;text-decoration:none}}
-    a:hover{{text-decoration:underline}}
-    .btn{{
-      display:block;width:100%;margin-top:16px;padding:12px;
-      background:#00ff88;color:#000;font-weight:bold;font-size:13px;
-      border:none;border-radius:6px;cursor:pointer;text-align:center;
-      text-decoration:none;font-family:monospace;
-    }}
-    code{{background:#252525;padding:2px 6px;border-radius:3px;font-size:11px}}
-  </style>
-</head>
-<body>
-<div class="card">
-  <h2>🔐 Session Setup</h2>
-  <p>Create your Telegram session using the web login below.<br>
-     Both login and bot run on Render — same IP, no ban risk.</p>
+# ── GET /debug ────────────────────────────────────────────────────
+@app.get("/debug")
+async def debug():
+    return {
+        "pending":     {k: v for k, v in results.items()
+                        if v["status"] == "pending"},
+        "done_count":  sum(1 for v in results.values()
+                           if v["status"] == "done"),
+        "bot":         BOT_USERNAME,
+        "connected":   client.is_connected() if client else False,
+        "last_msgs":   last_msgs[-5:],
+    }
 
-  <div class="step">
-    <b>Step 1</b> — Open the session creator:<br>
-    <a href="https://tg-n7dh.onrender.com/register" target="_blank">
-      https://tg-n7dh.onrender.com/register
-    </a>
-  </div>
-  <div class="step">
-    <b>Step 2</b> — Enter your phone number + OTP → copy the session string
-  </div>
-  <div class="step">
-    <b>Step 3</b> — Go to your Render dashboard → Environment → add:<br>
-    <code>TG_SESSION</code> = (paste session string)<br>
-    <code>TG_API_ID</code> = your api_id from my.telegram.org<br>
-    <code>TG_API_HASH</code> = your api_hash<br>
-    <code>TG_CHANNEL</code> = @yourchannel<br>
-    <code>SECRET_KEY</code> = any password
-  </div>
-  <div class="step">
-    <b>Step 4</b> — Redeploy → check <a href="/health">/health</a> → userbot online ✓
-  </div>
+# ── GET /test-bot ─────────────────────────────────────────────────
+@app.get("/test-bot")
+async def test_bot(secret: str = ""):
+    """Send test message to bot and read last 3 replies."""
+    if secret != SECRET_KEY:
+        raise HTTPException(401, "Unauthorized")
+    if not client or not client.is_connected():
+        raise HTTPException(503, "Offline")
+    sent = await client.send_message(BOT_USERNAME, "https://arolinks.com/test")
+    msgs = []
+    async for msg in client.iter_messages(BOT_USERNAME, limit=5):
+        msgs.append({
+            "id":       msg.id,
+            "from_id":  str(msg.from_id),
+            "reply_to": msg.reply_to_msg_id,
+            "text":     (msg.text or "")[:200],
+        })
+    return {"sent_id": sent.id, "last_messages": msgs}
 
-  <a class="btn" href="https://tg-n7dh.onrender.com/register" target="_blank">
-    → Open Session Creator
-  </a>
-</div>
-</body>
-</html>
-""")
-
-# ── / root ────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {
-        "service": "AroLink Catcher v2",
-        "session_setup": "/session-setup",
-        "health": "/health",
-        "resolve": "POST /resolve"
-    }
+    return {"service": "AroLink Catcher v9",
+            "bot": BOT_USERNAME,
+            "endpoints": ["/health", "/debug", "/test-bot?secret=xxx",
+                          "POST /submit", "GET /result/{req_id}"]}
