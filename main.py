@@ -25,7 +25,7 @@ API_ID       = int(os.environ.get("TG_API_ID", "21952127"))
 API_HASH     = os.environ.get("TG_API_HASH", "e0a3741bb3b132947d86d8fc6218eebe")
 SESSION_STR  = os.environ.get("TG_SESSION", "")
 SECRET_KEY   = os.environ.get("SECRET_KEY", "changeme")
-RENDER_URL   = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+RENDER_URL   = os.environ.get("RENDER_EXTERNAL_URL", "https://extension-60gp.onrender.com").rstrip("/")
 BOT_USER_ID  = int(os.environ.get("BOT_USER_ID", "8226002644"))
 BOT_USERNAME = os.environ.get("BYPASS_BOT", "@Nick_Bypass_Bot")
 
